@@ -1,4 +1,3 @@
-import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import ccxt from 'ccxt';
@@ -7,8 +6,71 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import crypto from 'crypto';
 import { deltaClient } from './deltaClient';
+import { google } from 'googleapis';
+import { calculateEmaSeries, calculateRSI, calculateRSISeries, calculateBollingerBands, calculateBollingerBandsSeries, calculateATR, calculateAtrSeries, isVolumeAboveAverage } from './src/utils/indicators';
 
 dotenv.config();
+
+let googleAccessToken = '';
+let googleSpreadsheetId = '';
+
+async function getOrCreateSpreadsheet(token: string) {
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: token });
+  const sheets = google.sheets({ version: 'v4', auth });
+  const drive = google.drive({ version: 'v3', auth });
+
+  if (!googleSpreadsheetId) {
+    const res = await drive.files.list({
+      q: "name='Delta Trades' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+      fields: 'files(id, name)',
+    });
+    if (res.data.files && res.data.files.length > 0) {
+      googleSpreadsheetId = res.data.files[0].id!;
+    } else {
+      const createRes = await sheets.spreadsheets.create({
+        requestBody: {
+          properties: { title: 'Delta Trades' },
+          sheets: [{ properties: { title: 'Trades' } }]
+        }
+      });
+      googleSpreadsheetId = createRes.data.spreadsheetId!;
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: googleSpreadsheetId,
+        range: 'Trades!A1',
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [['Date', 'Symbol', 'Side', 'Type', 'Size', 'Price', 'Order ID']] }
+      });
+    }
+  }
+  return { sheets, spreadsheetId: googleSpreadsheetId };
+}
+
+async function appendTradeToSheet(trade: any) {
+  if (!googleAccessToken) return;
+  try {
+    const { sheets, spreadsheetId } = await getOrCreateSpreadsheet(googleAccessToken);
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'Trades!A1',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          new Date().toISOString(),
+          trade.symbol,
+          trade.side,
+          trade.orderType,
+          trade.size,
+          trade.price,
+          trade.orderId
+        ]]
+      }
+    });
+    console.log(`[Google Sheets] Trade appended for ${trade.symbol}`);
+  } catch (err: any) {
+    console.error('[Google Sheets] Failed to write to Google Sheets:', err.message);
+  }
+}
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -56,6 +118,20 @@ app.use((req, res, next) => {
 
   res.set('WWW-Authenticate', 'Basic realm="401"');
   res.status(401).send('Authentication required.');
+});
+
+app.get('/api/google-config', (req, res) => {
+  try {
+    const config = JSON.parse(fs.readFileSync('./firebase-applet-config.json', 'utf8'));
+    res.json({ clientId: config.oAuthClientId });
+  } catch (err) {
+    res.json({ clientId: '' });
+  }
+});
+
+app.post('/api/google-auth', (req, res) => {
+  googleAccessToken = req.body.token;
+  res.json({ success: true });
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -149,7 +225,9 @@ interface TradingSlot {
   orderType: 'market' | 'limit';
   takeProfitPct: number;
   stopLossPct: number;
-  strategy: 'always_in' | 'standard';
+  strategy: 'always_in',
+  tradeDirection: 'both' | 'standard';
+  tradeDirection?: 'both' | 'long' | 'short';
   lastExecutedCandleTime: number;
   lastSignal: string; // 'BUY' | 'SELL' | 'NONE'
   // --- Signal filters ---
@@ -275,7 +353,10 @@ async function placeDeltaMarketOrder(
 
       const leverage = Number(slot.leverage) || 1;
       const percent = Math.min(Math.max(sizeInput, 0), 100) / 100;
-      const purchasingPower = freeUsd * leverage * percent;
+      const totalUsd = usdAsset ? (parseFloat(usdAsset.equity) || parseFloat(usdAsset.balance) || freeUsd) : 0;
+      const rawMarginTarget = totalUsd * percent;
+      const marginToUse = Math.min(rawMarginTarget, freeUsd);
+      const purchasingPower = marginToUse * leverage;
 
       const prod = productsCache.find((p: any) => p.id === productId);
       const contractValue = prod ? parseFloat(prod.contract_value) : 1;
@@ -327,8 +408,16 @@ async function placeDeltaMarketOrder(
     const isLimit = slot.orderType === 'limit';
     const priceToUse = _limitPrice ? Number(_limitPrice) : currentPrice;
 
-    // Explicitly verified Issue #17: formatPrice perfectly matches App.tsx to avoid inconsistency
-    const formatPrice = (val: number) => { if (val === undefined || val === null) return '0.00'; return val < 1 ? val.toFixed(6) : val < 10 ? val.toFixed(4) : val.toFixed(2); };
+    const prod = productsCache.find((p: any) => p.id === productId);
+    const tickSize = prod && prod.tick_size ? parseFloat(prod.tick_size) : null;
+    const formatPrice = (val: number) => {
+      if (val === undefined || val === null) return '0.00';
+      if (tickSize) {
+        const inv = 1.0 / tickSize;
+        return (Math.round(val * inv) / inv).toFixed(prod.tick_size.split('.')[1]?.length || 0);
+      }
+      return val < 1 ? val.toFixed(6) : val < 10 ? val.toFixed(4) : val.toFixed(2);
+    };
 
     let finalOrderType: 'market_order' | 'limit_order' = 'market_order';
 
@@ -407,249 +496,20 @@ async function placeDeltaMarketOrder(
       }
     }
 
+    // Google Sheets integration
+    appendTradeToSheet({
+      symbol,
+      side: orderSide,
+      orderType: finalOrderType,
+      size,
+      price: priceToUse,
+      orderId: placedOrder?.id || 'unknown'
+    }).catch(e => console.error(e));
+
     return placedOrder;
   } catch (error: any) {
     throw new Error(`Delta API Error during trade execution: ${formatDeltaError(error)}`);
   }
-}
-
-// ══════════════════════════════════════════════════════════════════
-// EMA CALCULATION
-// ══════════════════════════════════════════════════════════════════
-
-const calculateEmaSeries = (prices: number[], period: number) => {
-  const k = 2 / (period + 1);
-  // Seed with SMA of first `period` prices for accuracy (standard Wilder seeding)
-  if (prices.length < period) return prices.map(() => prices[0]);
-  const seed = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  const ema = new Array(period).fill(seed);
-  for (let i = period; i < prices.length; i++) {
-    ema.push(prices[i] * k + ema[i - 1] * (1 - k));
-  }
-  return ema;
-};
-
-// ══════════════════════════════════════════════════════════════════
-// RSI CALCULATION
-// ══════════════════════════════════════════════════════════════════
-
-function calculateRSI(closes: number[], period: number = 14): number {
-  if (closes.length < period + 1) return 50; // neutral if not enough data
-
-  let avgGain = 0;
-  let avgLoss = 0;
-
-  // Initial average gain/loss over first `period` changes
-  for (let i = 1; i <= period; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change > 0) avgGain += change;
-    else avgLoss += Math.abs(change);
-  }
-  avgGain /= period;
-  avgLoss /= period;
-
-  // Smooth using Wilder's method for remaining data
-  for (let i = period + 1; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change > 0) {
-      avgGain = (avgGain * (period - 1) + change) / period;
-      avgLoss = (avgLoss * (period - 1)) / period;
-    } else {
-      avgGain = (avgGain * (period - 1)) / period;
-      avgLoss = (avgLoss * (period - 1) + Math.abs(change)) / period;
-    }
-  }
-
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
-// ══════════════════════════════════════════════════════════════════
-// RSI SERIES (precomputed for backtester — avoids O(n²) recomputation)
-// ══════════════════════════════════════════════════════════════════
-function calculateRSISeries(closes: number[], period: number = 14): number[] {
-  const rsiArr: number[] = new Array(closes.length).fill(50);
-  if (closes.length < period + 1) return rsiArr;
-
-  let avgGain = 0;
-  let avgLoss = 0;
-
-  for (let i = 1; i <= period; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change > 0) avgGain += change;
-    else avgLoss += Math.abs(change);
-  }
-  avgGain /= period;
-  avgLoss /= period;
-
-  rsiArr[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-
-  for (let i = period + 1; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change > 0) {
-      avgGain = (avgGain * (period - 1) + change) / period;
-      avgLoss = (avgLoss * (period - 1)) / period;
-    } else {
-      avgGain = (avgGain * (period - 1)) / period;
-      avgLoss = (avgLoss * (period - 1) + Math.abs(change)) / period;
-    }
-    rsiArr[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  }
-
-  return rsiArr;
-}
-
-// ══════════════════════════════════════════════════════════════════
-// BOLLINGER BANDS CALCULATION
-// Used by: runSlotCycle (live bot filter at L~1001).
-// NOTE: The backtest inlines BB math directly (avoids function call + extra slice allocation).
-// ══════════════════════════════════════════════════════════════════
-function calculateBollingerBands(closes: number[], period: number = 20, stdDev: number = 2) {
-  if (closes.length < period) return { upper: 0, lower: 0, sma: 0 };
-  const slice = closes.slice(-period);
-  const sma = slice.reduce((a, b) => a + b, 0) / period;
-  const variance = slice.reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period;
-  const std = Math.sqrt(variance);
-  return {
-    upper: sma + (std * stdDev),
-    lower: sma - (std * stdDev),
-    sma
-  };
-}
-
-function calculateBollingerBandsSeries(closes: number[], period: number = 20, stdDev: number = 2) {
-  const upper = new Array(closes.length).fill(0);
-  const lower = new Array(closes.length).fill(0);
-  const sma = new Array(closes.length).fill(0);
-
-  if (closes.length < period) return { upper, lower, sma };
-
-  let sum = 0;
-  let sumSq = 0;
-
-  for (let i = 0; i < period; i++) {
-    const val = closes[i];
-    sum += val;
-    sumSq += val * val;
-  }
-
-  const firstSma = sum / period;
-  const firstVar = (sumSq - (sum * sum) / period) / period;
-  const firstStd = Math.sqrt(Math.max(0, firstVar));
-  upper[period - 1] = firstSma + firstStd * stdDev;
-  lower[period - 1] = firstSma - firstStd * stdDev;
-  sma[period - 1] = firstSma;
-
-  for (let i = period; i < closes.length; i++) {
-    const outgoing = closes[i - period];
-    const incoming = closes[i];
-
-    sum += incoming - outgoing;
-    sumSq += incoming * incoming - outgoing * outgoing;
-
-    const currentSma = sum / period;
-    const currentVar = (sumSq - (sum * sum) / period) / period;
-    const currentStd = Math.sqrt(Math.max(0, currentVar));
-
-    upper[i] = currentSma + currentStd * stdDev;
-    lower[i] = currentSma - currentStd * stdDev;
-    sma[i] = currentSma;
-  }
-
-  return { upper, lower, sma };
-}
-
-// ══════════════════════════════════════════════════════════════════
-// MACD CALCULATION
-// ══════════════════════════════════════════════════════════════════
-function calculateMACD(closes: number[], fast: number = 12, slow: number = 26, signalPeriod: number = 9) {
-  const fastEma = calculateEmaSeries(closes, fast);
-  const slowEma = calculateEmaSeries(closes, slow);
-  const macdLine = fastEma.map((f, i) => f - slowEma[i]);
-  const signalLine = calculateEmaSeries(macdLine, signalPeriod);
-  const histogram = macdLine.map((m, i) => m - signalLine[i]);
-  return {
-    macdLine: macdLine[macdLine.length - 1],
-    signalLine: signalLine[signalLine.length - 1],
-    histogram: histogram[histogram.length - 1]
-  };
-}
-
-// ══════════════════════════════════════════════════════════════════
-// ATR CALCULATION
-// ══════════════════════════════════════════════════════════════════
-function calculateATR(highs: number[], lows: number[], closes: number[], period: number = 14) {
-  if (closes.length < period + 1) return 0;
-  
-  // 1. Calculate initial ATR (SMA of first `period` TRs)
-  let trSum = 0;
-  for (let i = 1; i <= period; i++) {
-    const tr = Math.max(
-      highs[i] - lows[i],
-      Math.abs(highs[i] - closes[i - 1]),
-      Math.abs(lows[i] - closes[i - 1])
-    );
-    trSum += tr;
-  }
-  let atr = trSum / period;
-
-  // 2. Apply Wilder's Smoothing for the rest of the series
-  for (let i = period + 1; i < closes.length; i++) {
-    const tr = Math.max(
-      highs[i] - lows[i],
-      Math.abs(highs[i] - closes[i - 1]),
-      Math.abs(lows[i] - closes[i - 1])
-    );
-    atr = (atr * (period - 1) + tr) / period;
-  }
-  
-  return atr;
-}
-
-function calculateAtrSeries(highs: number[], lows: number[], closes: number[], period: number = 14): number[] {
-  const result: number[] = new Array(closes.length).fill(0);
-  if (closes.length < period + 1) return result;
-  
-  let trSum = 0;
-  for (let i = 1; i <= period; i++) {
-    const tr = Math.max(
-      highs[i] - lows[i],
-      Math.abs(highs[i] - closes[i - 1]),
-      Math.abs(lows[i] - closes[i - 1])
-    );
-    trSum += tr;
-  }
-  let atr = trSum / period;
-  result[period] = atr;
-
-  for (let i = period + 1; i < closes.length; i++) {
-    const tr = Math.max(
-      highs[i] - lows[i],
-      Math.abs(highs[i] - closes[i - 1]),
-      Math.abs(lows[i] - closes[i - 1])
-    );
-    atr = (atr * (period - 1) + tr) / period;
-    result[i] = atr;
-  }
-  return result;
-}
-
-// ══════════════════════════════════════════════════════════════════
-// VOLUME FILTER
-// ══════════════════════════════════════════════════════════════════
-
-function isVolumeAboveAverage(ohlcv: any[], lookback: number = 20): boolean {
-  if (ohlcv.length < lookback + 2) return true; // not enough data, allow trade
-  const closedIdx = ohlcv.length - 2; // last closed candle
-  const currentVolume = ohlcv[closedIdx][5] as number;
-
-  let totalVolume = 0;
-  for (let i = closedIdx - lookback; i < closedIdx; i++) {
-    totalVolume += ohlcv[i][5] as number;
-  }
-  const avgVolume = totalVolume / lookback;
-  return currentVolume >= avgVolume;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1181,8 +1041,10 @@ async function runSlotCycle(slot: TradingSlot) {
     }
 
     // Standard strategy: only close, do NOT enter opposite
-    if (slot.strategy !== 'always_in') {
-      addLog(`📋 [${slot.symbol}] Strategy=standard: Closed. Will NOT enter new ${orderSide.toUpperCase()}.`, 'info');
+    const isDirectionAllowed = !slot.tradeDirection || slot.tradeDirection === 'both' || (slot.tradeDirection === 'long' && orderSide === 'buy') || (slot.tradeDirection === 'short' && orderSide === 'sell');
+
+    if (slot.strategy !== 'always_in' || !isDirectionAllowed) {
+      addLog(`📋 [${slot.symbol}] Strategy=standard or Direction restricted: Closed position. Will NOT enter new ${orderSide.toUpperCase()}.`, 'info');
       slot.lastExecutedCandleTime = closedCandleTime;
       slot.lastSignal             = crossStateStr;
       slot.lastTradeCandles       = closedCandleTime;
@@ -1219,6 +1081,15 @@ async function runSlotCycle(slot: TradingSlot) {
   const slotForEntry: TradingSlot = slot.useAtrSl && dynamicSlPct != null
     ? { ...slot, stopLossPct: dynamicSlPct }
     : slot;
+
+  // ── STEP 3.9: Check Trade Direction ──
+  const isDirectionAllowedEntry = !slot.tradeDirection || slot.tradeDirection === 'both' || (slot.tradeDirection === 'long' && orderSide === 'buy') || (slot.tradeDirection === 'short' && orderSide === 'sell');
+  if (!isDirectionAllowedEntry) {
+    addLog(`⏭️ [${slot.symbol}] Skipping ${orderSide.toUpperCase()} entry because Trade Direction is restricted to ${slot.tradeDirection.toUpperCase()}.`, 'info');
+    slot.lastExecutedCandleTime = closedCandleTime;
+    slot.lastSignal             = crossStateStr;
+    return;
+  }
 
   // ── STEP 4: Enter new position ──
   addLog(`🚀 [${slot.symbol}] Entering ${orderSide.toUpperCase()} × ${targetSize} contracts...`, 'info');
@@ -1339,6 +1210,14 @@ app.post('/api/close_position', async (req, res) => {
     const closingSide = (side as string).toLowerCase() === 'buy' || (side as string).toLowerCase() === 'long' ? 'sell' : 'buy';
 
     const result = await deltaClient.placeOrder(productId, Math.floor(closeSize), closingSide, 'market_order', { reduce_only: true });
+    appendTradeToSheet({
+      symbol,
+      side: closingSide,
+      orderType: 'market_order',
+      size: Math.floor(closeSize),
+      price: 'Market Close',
+      orderId: result.result?.id || result?.id || 'unknown'
+    }).catch(e => console.error(e));
     return res.json({ success: true, result });
   } catch (error: any) {
     const msg = formatDeltaError(error);
@@ -1349,6 +1228,16 @@ app.post('/api/close_position', async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 // DELTA API PROXY ROUTES
 // ══════════════════════════════════════════════════════════════════
+
+app.get('/api/delta/verify_order/:id', async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const result = await deltaClient.verifyOrderExecution(orderId);
+    return res.json(result);
+  } catch (error: any) {
+    return res.status(400).json({ success: false, message: formatDeltaError(error) });
+  }
+});
 
 app.get('/api/delta/products', async (req, res) => {
   try {
@@ -1548,7 +1437,7 @@ app.get('/api/slots', (req, res) => {
 app.post('/api/slots/add', (req, res) => {
   const {
     symbol, timeframe, fastEmaPeriod, slowEmaPeriod, size, leverage,
-    allocationType, orderType, takeProfitPct, stopLossPct, strategy,
+    allocationType, orderType, takeProfitPct, stopLossPct, strategy, tradeDirection,
     useRsiFilter, rsiPeriod, rsiOverbought, rsiOversold,
     useVolumeFilter, cooldownCandles,
     // Advanced signal filters
@@ -1604,6 +1493,7 @@ app.post('/api/slots/add', (req, res) => {
     takeProfitPct:         parsedTp,
     stopLossPct:           parsedSl,
     strategy:              strategy        || 'always_in',
+    tradeDirection:        tradeDirection  || 'both',
     lastExecutedCandleTime: 0,
     lastSignal:            'NONE',
     // Filters
@@ -1824,6 +1714,13 @@ app.post('/api/manual-trade', async (req, res) => {
 // API ROUTES — Backtesting
 // ══════════════════════════════════════════════════════════════════
 
+
+function getContractValue(symbol: string): number {
+  if (productsCache.length === 0) return 1;
+  const prod = productsCache.find((p: any) => p.symbol === symbol || p.symbol === symbol.replace('/', ''));
+  return prod ? parseFloat(prod.contract_value) : 1;
+}
+
 app.post('/api/backtest', async (req, res) => {
   if (!checkRateLimit(req.ip || 'unknown', 'backtest', 2000)) {
     return res.status(429).json({ success: false, message: 'Too many requests. Please wait.' });
@@ -1852,7 +1749,7 @@ app.post('/api/backtest', async (req, res) => {
     // Default to 2 years ago if no start date is provided to ensure deep backtests
     let currentSince = config.startDate 
       ? new Date(config.startDate).getTime() 
-      : Date.now() - (2 * 365 * 24 * 60 * 60 * 1000);
+      : Date.now() - ((Number(config.optDays) || (2 * 365)) * 24 * 60 * 60 * 1000);
     const endTime = config.endDate ? new Date(config.endDate).getTime() : Date.now();
 
     while (ohlcv.length < maxCandles) {
@@ -1880,7 +1777,8 @@ app.post('/api/backtest', async (req, res) => {
       lows: ohlcv.map((c: any[]) => c[3] as number),
       volumes: ohlcv.map((c: any[]) => c[5] as number)
     };
-    const results = simulateBacktest(config, mappedData);
+    const cv = getContractValue(config.symbol);
+    const results = simulateBacktest(config, mappedData, cv);
     res.json({ success: true, results });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
@@ -1966,7 +1864,8 @@ async function runGeneticOptimization(config: any, timeframesData: Record<string
       ...ind
     };
     const mappedData = timeframesData[ind.timeframe];
-    const res = simulateBacktest(runConfig, mappedData);
+    const cv = getContractValue(runConfig.symbol);
+    const res = simulateBacktest(runConfig, mappedData, cv);
     const profitPct = res.netProfitPct;
     const dd = res.maxDrawdown;
     let score = profitPct * (1 - dd / 100);
@@ -2206,7 +2105,8 @@ async function runCombinatorialOptimization(config: any, timeframesData: Record<
             ...boolPerm,
             timeframe: tf
           };
-          const resObj = simulateBacktest(runConfig, tfData);
+          const cv = getContractValue(runConfig.symbol);
+          const resObj = simulateBacktest(runConfig, tfData, cv);
           
           allResults.push({
              ...currentNumericParams,
@@ -2291,7 +2191,7 @@ app.post('/api/optimize', async (req, res) => {
         let ohlcv: any[] = [];
         let currentSince = config.startDate 
           ? new Date(config.startDate).getTime() 
-          : Date.now() - (2 * 365 * 24 * 60 * 60 * 1000);
+          : Date.now() - ((Number(config.optDays) || (2 * 365)) * 24 * 60 * 60 * 1000);
         const endTime = config.endDate ? new Date(config.endDate).getTime() : Date.now();
 
         while (ohlcv.length < maxCandles) {
@@ -2387,6 +2287,26 @@ app.post('/api/optimize', async (req, res) => {
       return r;
     });
 
+    const uniqueRes = [];
+    const seen = new Set();
+    for (const r of topResults) {
+      let sig = `${r.symbol || config.symbol}_${r.timeframe}_${r.fastEma ?? r.fastEmaPeriod}_${r.slowEma ?? r.slowEmaPeriod}`;
+      if (r.useRsiFilter) sig += `_rsi${r.rsiPeriod}_${r.rsiOverbought}_${r.rsiOversold}`;
+      if (r.useBbFilter) sig += `_bb${r.bbPeriod}_${r.bbStdDev}`;
+      if (r.useAtrSl) sig += `_atr${r.atrMultiplier}`;
+      if (r.useGridPyramiding) sig += `_grid${r.gridStepPct}_${r.maxPyramidLevels}`;
+      if (r.useTrendFilter) sig += `_trend`;
+      if (r.usePriceConfirmation) sig += `_price`;
+      if (r.useVolumeFilter) sig += `_vol`;
+      if (r.emaGapMinPct > 0) sig += `_gap${r.emaGapMinPct}`;
+      if (r.cooldownCandles > 0) sig += `_cd${r.cooldownCandles}`;
+      if (!seen.has(sig)) {
+        seen.add(sig);
+        uniqueRes.push(r);
+      }
+    }
+    topResults = uniqueRes;
+
     res.json({ success: true, results: topResults });
   } catch (error: any) {
     if (error.message === 'Optimization stopped by user') {
@@ -2401,7 +2321,7 @@ app.post('/api/optimize/stop', (req, res) => {
   res.json({ success: true, message: 'Optimization stopping...' });
 });
 
-function simulateBacktest(config: any, data: any) {
+function simulateBacktest(config: any, data: any, contractValue: number = 1) {
   const { closes, opens, highs, lows, volumes, ohlcv } = data;
   const cache = data.cache || {};
 
@@ -2416,6 +2336,7 @@ function simulateBacktest(config: any, data: any) {
   
   const allocationType = config.allocationType || 'fixed';
   const sizeVal        = Number(config.size) || 10;
+  const tradeDirection = config.tradeDirection || 'both';
   
   const useAtrSl      = Boolean(config.useAtrSl);
   const atrMultiplier = Number(config.atrMultiplier)   || 1.5;
@@ -2528,8 +2449,8 @@ function simulateBacktest(config: any, data: any) {
              const fillPrice = gridTarget;
              
              let marginToAdd = 0;
-             if (allocationType === 'fixed') marginToAdd = sizeVal;
-             else if (allocationType === 'percent') marginToAdd = balance * (sizeVal / 100);
+                          if (allocationType === 'fixed') marginToAdd = (sizeVal * contractValue * fillPrice) / leverage;
+             else if (allocationType === 'percent') marginToAdd = balance * (Math.min(sizeVal, 100) / 100);
              else marginToAdd = sizeVal; 
 
              balance -= marginToAdd * feePct; 
@@ -2606,7 +2527,10 @@ function simulateBacktest(config: any, data: any) {
 
     const isCrossUp   = prevFast <= prevSlow && currFast > currSlow;
     const isCrossDown = prevFast >= prevSlow && currFast < currSlow;
-    const freshSignal = isCrossUp ? 'BUY' : isCrossDown ? 'SELL' : 'NONE';
+    
+    let freshSignal = 'NONE';
+    if (isCrossUp && (tradeDirection === 'both' || tradeDirection === 'long')) freshSignal = 'BUY';
+    if (isCrossDown && (tradeDirection === 'both' || tradeDirection === 'short')) freshSignal = 'SELL';
     let signal = 'NONE';
 
     const evaluateFilters = (sig: string, idx: number) => {
@@ -2682,13 +2606,16 @@ function simulateBacktest(config: any, data: any) {
 
     if (!slTpExited && cooldownCandles > 0 && (i - lastTradeCandleIdx) < cooldownCandles) continue;
 
+    const isDirectionAllowed = !tradeDirection || tradeDirection === 'both' || (tradeDirection === 'long' && signal === 'BUY') || (tradeDirection === 'short' && signal === 'SELL');
+
     if (inPosition) {
       if (positionSide === signal) continue;
 
       // Explicitly verified Issue #14: Bounds check (i + 1 < ohlcv.length) protects against undefined opens[i+1]
       const exitExecPrice = i + 1 < ohlcv.length ? opens[i + 1] : closes[i];
       const safeExitIdx = i + 1 < ohlcv.length ? i + 1 : i;
-      if (shouldReverse) {
+
+      if (shouldReverse && isDirectionAllowed) {
         recordExit(positionSide, entryPrice, exitExecPrice, 'REVERSAL', safeExitIdx);
       } else {
         recordExit(positionSide, entryPrice, exitExecPrice, 'SIGNAL_EXIT', safeExitIdx);
@@ -2698,6 +2625,7 @@ function simulateBacktest(config: any, data: any) {
     }
 
     if (!inPosition) {
+      if (!isDirectionAllowed) continue;
       inPosition   = true;
       positionSide = signal;
       const safeNextIdx = i + 1 < ohlcv.length ? i + 1 : i;
@@ -2706,10 +2634,12 @@ function simulateBacktest(config: any, data: any) {
       entryPrice = nextOpen * (signal === 'BUY' ? (1 + slipPct) : (1 - slipPct));
       initialEntryPrice = entryPrice;
       
-      if (allocationType === 'fixed') {
-        positionMargin = sizeVal;
+            if (allocationType === 'fixed') {
+        positionMargin = (sizeVal * contractValue * entryPrice) / leverage;
+      } else if (allocationType === 'percent') {
+        positionMargin = balance * (Math.min(sizeVal, 100) / 100);
       } else {
-        positionMargin = balance * (sizeVal / 100);
+        positionMargin = sizeVal;
       }
       if (positionMargin > balance) positionMargin = balance;
       if (positionMargin <= 0) {

@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Play, Square, Activity, Terminal, AlertCircle, RefreshCw, Plus, X, Trash2 } from 'lucide-react';
 import ApiReference from './components/ApiReference';
+import Analytics from './components/Analytics';
+import { BarChart2 } from 'lucide-react';
 
 interface LogEntry {
   time: string;
@@ -28,6 +30,7 @@ interface TradingSlot {
   takeProfitPct: number | string;
   stopLossPct: number | string;
   strategy: string;
+  tradeDirection?: string;
   lastSignal: string;
   useRsiFilter?: boolean;
   rsiPeriod?: number;
@@ -57,7 +60,10 @@ interface TradingSlot {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'trade' | 'api'>('trade');
+  const [googleConnected, setGoogleConnected] = useState(false);
+  const [googleClientId, setGoogleClientId] = useState('');
+
+  const [activeTab, setActiveTab] = useState<'trade' | 'analytics' | 'api'>('trade');
   const [isRunning, setIsRunning] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [slots, setSlots] = useState<TradingSlot[]>([]);
@@ -79,6 +85,7 @@ export default function App() {
           useGridPyramiding: false,
           gridStepPct: 1.0 as number | string,
           maxPyramidLevels: 3 as number | string,
+          optDays: 30 as number | string,
           ...parsed,
         };
       } catch (e) {}
@@ -96,6 +103,7 @@ export default function App() {
       takeProfitPct: '' as number | string,
       stopLossPct: '' as number | string,
       strategy: 'always_in' as 'always_in' | 'standard',
+      tradeDirection: 'both' as 'both' | 'long' | 'short',
       // Signal filters
       useRsiFilter: false,
       rsiPeriod: 14 as number | string,
@@ -113,6 +121,7 @@ export default function App() {
       useGridPyramiding: false,
       gridStepPct: 1.0 as number | string,
       maxPyramidLevels: 3 as number | string,
+      optDays: 30 as number | string,
       // Backtest
       startDate: '',
       endDate: '',
@@ -238,6 +247,35 @@ export default function App() {
     const symbolRefreshInterval = setInterval(fetchSymbols, 3600000);
     return () => clearInterval(symbolRefreshInterval);
   }, []);
+
+  useEffect(() => {
+    fetch('/api/google-config')
+      .then(r => r.json())
+      .then(data => {
+        if (data.clientId) setGoogleClientId(data.clientId);
+      })
+      .catch(console.error);
+  }, []);
+
+  const handleGoogleLogin = () => {
+    if (!googleClientId) return;
+    const client = (window as any).google.accounts.oauth2.initTokenClient({
+      client_id: googleClientId,
+      scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file',
+      callback: async (response: any) => {
+        if (response.access_token) {
+          await fetch('/api/google-auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: response.access_token })
+          });
+          setGoogleConnected(true);
+          alert('✅ Connected to Google Sheets! Trades will now be logged.');
+        }
+      },
+    });
+    client.requestAccessToken();
+  };
 
   const fetchStatus = async () => {
     try {
@@ -560,17 +598,24 @@ export default function App() {
           <div>
             <h1 className="text-3xl font-bold tracking-tight text-slate-900 flex items-center gap-3">
               <Activity className="w-8 h-8 text-emerald-600" />
-              Delta Trade Engine
+              Scylca
             </h1>
             <p className="text-slate-500 mt-1 text-sm">Multi-Asset EMA Crossover Engine</p>
           </div>
 
+          
           <div className="flex bg-slate-200/50 p-1 rounded-lg">
             <button 
               onClick={() => setActiveTab('trade')}
               className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-semibold transition-all ${activeTab === 'trade' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
             >
               <Activity className="w-4 h-4" /> Trade Engine
+            </button>
+            <button 
+              onClick={() => setActiveTab('analytics')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-semibold transition-all ${activeTab === 'analytics' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+            >
+              <BarChart2 className="w-4 h-4" /> Analytics
             </button>
             <button 
               onClick={() => setActiveTab('api')}
@@ -581,6 +626,15 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
+            {googleClientId && (
+              <button
+                onClick={handleGoogleLogin}
+                disabled={googleConnected}
+                className={`border rounded-lg px-4 py-2.5 text-sm font-semibold transition-all shadow-sm ${googleConnected ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-white border-slate-200 hover:border-indigo-500 hover:text-indigo-600 text-slate-700'}`}
+              >
+                {googleConnected ? '✅ Sheets Connected' : '📊 Connect Sheets'}
+              </button>
+            )}
             <button 
               onClick={() => setShowApiManager(!showApiManager)}
               className="bg-white border border-slate-200 hover:border-indigo-500 hover:text-indigo-600 text-slate-700 rounded-lg px-4 py-2.5 text-sm font-semibold transition-all shadow-sm"
@@ -595,6 +649,13 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        
+        {activeTab === 'analytics' && (
+          <div className="mt-4">
+            <Analytics balances={balances} positions={positions} />
+          </div>
+        )}
 
         {activeTab === 'api' && (
           <div className="bg-slate-950 -mx-6 md:-mx-12 px-6 md:px-12 pb-12 rounded-3xl mt-4 border border-slate-800 shadow-2xl">
@@ -959,6 +1020,21 @@ export default function App() {
                     />
                   </div>
                 </button>
+
+                
+                {/* Trade Direction */}
+                <div className="mb-4">
+                  <label className="block text-xs font-semibold text-slate-500 mb-1">Trade Direction</label>
+                  <select
+                    className="w-full bg-slate-50 border border-slate-200 text-slate-700 rounded-lg px-3 py-2 text-sm font-medium focus:ring-2 focus:ring-indigo-500 focus:outline-none shadow-sm transition-all"
+                    value={botConfig.tradeDirection || 'both'}
+                    onChange={e => updateConfig('tradeDirection', e.target.value)}
+                  >
+                    <option value="both">Both (Long & Short)</option>
+                    <option value="long">Long Only</option>
+                    <option value="short">Short Only</option>
+                  </select>
+                </div>
 
                 {/* === SIGNAL QUALITY === */}
                 <div className="pt-3 border-t border-slate-200">
@@ -1415,17 +1491,29 @@ export default function App() {
                    </h3>
                    <p className="text-[10px] text-indigo-600 mb-3">Maximize performance using grid search or AI-driven evolutionary genetic search (Max 10k candles).</p>
                    
-                   <div className="mb-4">
-                     <label className="block text-[10px] font-bold text-slate-500 mb-1">Optimization Method</label>
-                     <select 
-                       value={botConfig.optimizationMethod || 'grid'}
-                       onChange={e => updateConfig('optimizationMethod', e.target.value)}
-                       className="w-full bg-white border border-indigo-100 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500"
-                     >
-                       <option value="grid">Grid Search (Optimize EMAs only)</option>
-                       <option value="genetic">🧬 Genetic Algorithm (Optimize EMAs + Active Filters)</option>
-                       <option value="brute_force">🔥 Brute Force (All Permutations)</option>
-                     </select>
+                   <div className="mb-4 grid grid-cols-2 gap-3">
+                     <div>
+                       <label className="block text-[10px] font-bold text-slate-500 mb-1">Optimization Method</label>
+                       <select 
+                         value={botConfig.optimizationMethod || 'grid'}
+                         onChange={e => updateConfig('optimizationMethod', e.target.value)}
+                         className="w-full bg-white border border-indigo-100 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500"
+                       >
+                         <option value="grid">Grid Search (Optimize EMAs only)</option>
+                         <option value="genetic">🧬 Genetic Algorithm (Optimize EMAs + Active Filters)</option>
+                         <option value="brute_force">🔥 Brute Force (All Permutations)</option>
+                       </select>
+                     </div>
+                     <div>
+                       <label className="block text-[10px] font-bold text-slate-500 mb-1">Days to Optimize</label>
+                       <input 
+                         type="number"
+                         min="1"
+                         value={botConfig.optDays || 30}
+                         onChange={e => updateConfig('optDays', e.target.value)}
+                         className="w-full bg-white border border-indigo-100 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500"
+                       />
+                     </div>
                    </div>
 
                     <div className="bg-indigo-100/30 p-3 rounded-lg border border-indigo-200/50 text-[10px] text-indigo-800 mb-4">
@@ -1619,6 +1707,56 @@ export default function App() {
                       alert('✅ Strategy configuration applied!');
                     };
 
+                    const addSlotFromResult = async (r: any, e: React.MouseEvent) => {
+                      e.stopPropagation();
+                      const sym = r.symbol || botConfig.symbol;
+                      const payload = {
+                        symbol: sym,
+                        timeframe: r.timeframe || botConfig.timeframe,
+                        fastEmaPeriod: r.fastEma ?? r.fastEmaPeriod ?? botConfig.fastEmaPeriod,
+                        slowEmaPeriod: r.slowEma ?? r.slowEmaPeriod ?? botConfig.slowEmaPeriod,
+                        size: botConfig.size,
+                        leverage: botConfig.leverage,
+                        allocationType: botConfig.allocationType,
+                        orderType: botConfig.orderType,
+                        takeProfitPct: botConfig.takeProfitPct,
+                        stopLossPct: botConfig.stopLossPct,
+                        strategy: botConfig.strategy,
+                        tradeDirection: botConfig.tradeDirection,
+                        useRsiFilter: r.useRsiFilter ?? false,
+                        rsiPeriod: r.rsiPeriod ?? botConfig.rsiPeriod,
+                        rsiOverbought: r.rsiOverbought ?? botConfig.rsiOverbought,
+                        rsiOversold: r.rsiOversold ?? botConfig.rsiOversold,
+                        useVolumeFilter: r.useVolumeFilter ?? false,
+                        cooldownCandles: r.cooldownCandles ?? botConfig.cooldownCandles,
+                        usePriceConfirmation: r.usePriceConfirmation ?? false,
+                        emaGapMinPct: r.emaGapMinPct ?? botConfig.emaGapMinPct,
+                        confirmCandles: botConfig.confirmCandles,
+                        useTrendFilter: r.useTrendFilter ?? false,
+                        useAtrSl: r.useAtrSl ?? false,
+                        atrMultiplier: r.atrMultiplier ?? botConfig.atrMultiplier,
+                        useBbFilter: r.useBbFilter ?? false,
+                        bbPeriod: r.bbPeriod ?? botConfig.bbPeriod,
+                        bbStdDev: r.bbStdDev ?? botConfig.bbStdDev,
+                        useGridPyramiding: r.useGridPyramiding ?? false,
+                        gridStepPct: r.gridStepPct ?? botConfig.gridStepPct,
+                        maxPyramidLevels: r.maxPyramidLevels ?? botConfig.maxPyramidLevels,
+                      };
+                      try {
+                        const resp = await fetch('/api/slots/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                        const data = await resp.json();
+                        if (data.success) {
+                          fetchStatus();
+                          fetchPositions();
+                          alert(`✅ Slot added: ${payload.symbol} ${payload.timeframe} EMA${payload.fastEmaPeriod}/${payload.slowEmaPeriod}`);
+                        } else {
+                          alert(`❌ Failed: ${data.message}`);
+                        }
+                      } catch (err: any) {
+                        alert(`❌ Error: ${err.message}`);
+                      }
+                    };
+
                     let filtered = optimizeResults.filter(r => {
                       if (optFilterTimeframe !== 'ALL' && r.timeframe !== optFilterTimeframe) return false;
                       if (optFilterMinWinRate && r.winRate < Number(optFilterMinWinRate)) return false;
@@ -1790,39 +1928,18 @@ export default function App() {
                                     <span className="block text-[9px] font-normal opacity-70">{(r.netProfitPct ?? 0) > 0 ? '+' : ''}{(r.netProfitPct ?? 0).toFixed(1)}%</span>
                                   </td>
                                   <td className="py-1.5 px-2 text-right whitespace-nowrap">
-                                    <button 
-                                      className="px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-[9px] font-bold rounded shadow-sm transition-colors"
-                                      onClick={async (e) => {
-                                        e.stopPropagation();
-                                        const sym = r.symbol || botConfig.symbol;
-                                        const mergedConfig = {
-                                          ...botConfig,
-                                          ...r,
-                                          fastEmaPeriod: r.fastEma ?? r.fastEmaPeriod,
-                                          slowEmaPeriod: r.slowEma ?? r.slowEmaPeriod,
-                                          symbol: sym
-                                        };
-                                        try {
-                                          const res = await fetch('/api/slots/add', {
-                                            method: 'POST',
-                                            headers: { 'Content-Type': 'application/json' },
-                                            body: JSON.stringify(mergedConfig)
-                                          });
-                                          const data = await res.json();
-                                          if (data.success) {
-                                            alert(`✅ Optimized Slot added for ${sym}!`);
-                                            fetchStatus();
-                                            fetchPositions();
-                                          } else {
-                                            alert(`Error: ${data.message}`);
-                                          }
-                                        } catch (err: any) {
-                                          alert(`Error: ${err.message}`);
-                                        }
-                                      }}
-                                    >
-                                      ➕ Add Slot
-                                    </button>
+                                    <div className="flex gap-1 justify-end">
+                                      <button
+                                        title="Apply settings to config form"
+                                        onClick={(e) => { e.stopPropagation(); applyResult(r); }}
+                                        className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 hover:bg-indigo-200 font-bold transition-colors whitespace-nowrap"
+                                      >⚙ Apply</button>
+                                      <button
+                                        title="Add as live trading slot"
+                                        onClick={(e) => addSlotFromResult(r, e)}
+                                        className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200 font-bold transition-colors whitespace-nowrap"
+                                      >➕ Slot</button>
+                                    </div>
                                   </td>
                                 </tr>
                               ))}
@@ -2023,7 +2140,7 @@ export default function App() {
                             Size: {slot.size} | {slot.leverage}x
                           </span>
                           <span className="text-xs text-slate-500">
-                            {slot.strategy === 'always_in' ? '🔄 S&R' : '📋 Std'}
+                            {slot.strategy === 'always_in' ? '🔄 S&R' : '📋 Std'} | {slot.tradeDirection === 'long' ? '📈 L' : slot.tradeDirection === 'short' ? '📉 S' : '↕️ B'}
                           </span>
                           {slot.useRsiFilter && (
                             <span className="text-[10px] font-semibold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">

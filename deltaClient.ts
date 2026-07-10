@@ -198,6 +198,15 @@ export class DeltaClient {
     const payload = { leverage: String(leverage) };
     return await this.makeRequest('POST', `/v2/products/${productId}/orders/leverage`, {}, payload);
   }
+
+  /**
+   * Trade execution verification foundation logic.
+   * Fetches an order by ID to confirm state (e.g. open, closed, cancelled) 
+   * and verify fill precision matching API requests.
+   */
+  async verifyOrderExecution(orderId: string | number) {
+    return await this.makeRequest('GET', `/v2/orders/${orderId}`);
+  }
 }
 
 // Global instance to replace CCXT Delta
