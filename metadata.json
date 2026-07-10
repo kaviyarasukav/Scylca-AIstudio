@@ -1,0 +1,6 @@
+{
+  "name": "Scylca Inspector",
+  "description": "An environment to inspect the kaviyarasukav/scylca GitHub repository.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

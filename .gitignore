@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.vscode/
+*.zip
+# Runtime state — should not be committed
+slots.json
+# Temp scripts
+git-push.cjs
+scratch/
