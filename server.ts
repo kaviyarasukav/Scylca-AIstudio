@@ -1,3 +1,4 @@
+import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import ccxt from 'ccxt';
@@ -225,8 +226,7 @@ interface TradingSlot {
   orderType: 'market' | 'limit';
   takeProfitPct: number;
   stopLossPct: number;
-  strategy: 'always_in',
-  tradeDirection: 'both' | 'standard';
+  strategy: 'always_in';
   tradeDirection?: 'both' | 'long' | 'short';
   lastExecutedCandleTime: number;
   lastSignal: string; // 'BUY' | 'SELL' | 'NONE'
@@ -1348,6 +1348,9 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/credentials', (req, res) => {
+  if (process.env.DELTA_KEY && process.env.DELTA_SECRET) {
+    return res.status(400).json({ success: false, message: 'API credentials are already active. Please clear past credentials first.' });
+  }
   let { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret || !apiKey.trim() || !apiSecret.trim()) {
     return res.status(400).json({ success: false, message: 'Missing API Key or Secret' });

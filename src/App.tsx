@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import { Play, Square, Activity, Terminal, AlertCircle, RefreshCw, Plus, X, Trash2 } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Play, Square, Activity, Terminal, AlertCircle, RefreshCw, Plus, X, Trash2, CheckCircle2, HelpCircle } from 'lucide-react';
 import ApiReference from './components/ApiReference';
 import Analytics from './components/Analytics';
 import { BarChart2 } from 'lucide-react';
+
 
 interface LogEntry {
   time: string;
@@ -59,14 +60,28 @@ interface TradingSlot {
   trailingSlPrice?: number;
 }
 
+// ─── Toast Notification System ───────────────────────────────────────────
+interface Toast { id: number; message: string; type: 'success' | 'error' | 'info'; }
+let toastIdCounter = 0;
+
 export default function App() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const showToast = useCallback((message: string, type: Toast['type'] = 'info') => {
+    const id = ++toastIdCounter;
+    setToasts(prev => [...prev.slice(-4), { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000);
+  }, []);
+
   const [googleConnected, setGoogleConnected] = useState(false);
   const [googleClientId, setGoogleClientId] = useState('');
+  const [showOAuthHelp, setShowOAuthHelp] = useState(false);
 
   const [activeTab, setActiveTab] = useState<'trade' | 'analytics' | 'api'>('trade');
   const [isRunning, setIsRunning] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [slots, setSlots] = useState<TradingSlot[]>([]);
+  const isTabVisible = useRef(true);
+
   
   // Bot Configuration (form state — used to ADD new slots)
   const [botConfig, setBotConfig] = useState(() => {
@@ -192,13 +207,11 @@ export default function App() {
 
   const saveBacktest = () => {
     if(!backtestResult) return;
-    // Explicitly verified Issue #20: Full trades array is stripped before saving to prevent localStorage limit exhaustion
     const { trades, ...resultWithoutTrades } = backtestResult;
-    // Explicitly fixes Issue M: Cap saved backtests at 20 entries to prevent memory exhaustion
     const newSaved = [{ ...resultWithoutTrades, timestamp: Date.now(), config: { ...botConfig } }, ...savedBacktests].slice(0, 20);
     setSavedBacktests(newSaved);
     localStorage.setItem('scylcaSavedBacktests', JSON.stringify(newSaved));
-    alert("Backtest saved!");
+    showToast('Backtest saved!', 'success');
   };
 
   const deleteSaved = (index: number) => {
@@ -215,6 +228,8 @@ export default function App() {
   const [showApiManager, setShowApiManager] = useState(false);
   const [isBacktesting, setIsBacktesting] = useState(false);
   const [backtestResult, setBacktestResult] = useState<any>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmBulk, setConfirmBulk] = useState(false);
 
   const [positions, setPositions] = useState<any[]>([]);
   const [balances, setBalances] = useState<any[]>([]);
@@ -224,6 +239,8 @@ export default function App() {
   ]);
   const [symbolSearchQuery, setSymbolSearchQuery] = useState('');
   const [isSymbolDropdownOpen, setIsSymbolDropdownOpen] = useState(false);
+  const [optSymbolSearchQuery, setOptSymbolSearchQuery] = useState('');
+  const [isOptSymbolDropdownOpen, setIsOptSymbolDropdownOpen] = useState(false);
   const [isRefreshingSymbols, setIsRefreshingSymbols] = useState(false);
 
   const fetchSymbols = async (force = false) => {
@@ -270,7 +287,7 @@ export default function App() {
             body: JSON.stringify({ token: response.access_token })
           });
           setGoogleConnected(true);
-          alert('✅ Connected to Google Sheets! Trades will now be logged.');
+          showToast('Connected to Google Sheets! Trades will now be logged.', 'success');
         }
       },
     });
@@ -318,7 +335,7 @@ export default function App() {
     }
   };
 
-  const updateConfig = async (key: string, value: string | number | boolean) => {
+  const updateConfig = async (key: string, value: any) => {
     const newConfig = { ...botConfig, [key]: value };
     setBotConfig(newConfig);
     localStorage.setItem('deltaBotConfig', JSON.stringify(newConfig));
@@ -338,16 +355,22 @@ export default function App() {
     let isMounted = true;
     let timeout: ReturnType<typeof setTimeout>;
 
-    // Explicitly verified Issue #11: Recursive setTimeout after await prevents request stacking
+    // Track tab visibility to back off polling when hidden
+    const onVisibilityChange = () => { isTabVisible.current = document.visibilityState === 'visible'; };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     const poll = async () => {
       if (!isMounted) return;
-      await Promise.allSettled([
-        fetchStatus(),
-        fetchPositions(),
-        fetchBalances()
-      ]);
+      if (isTabVisible.current) {
+        await Promise.allSettled([
+          fetchStatus(),
+          fetchPositions(),
+          fetchBalances()
+        ]);
+      }
       if (isMounted) {
-        timeout = setTimeout(poll, 2000);
+        // Poll at 2s when visible, 10s when tab is hidden (saves server load)
+        timeout = setTimeout(poll, isTabVisible.current ? 2000 : 10000);
       }
     };
 
@@ -355,6 +378,7 @@ export default function App() {
     return () => {
       isMounted = false;
       clearTimeout(timeout);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, []);
 
@@ -380,8 +404,6 @@ export default function App() {
 
   const executeManualTrade = async (side: 'BUY' | 'SELL') => {
     if (!botConfig.symbol || !botConfig.size) return;
-    
-    // Explicitly fixes Issue K: Provide UI feedback on manual trade execution
     try {
       const res = await fetch('/api/manual-trade', {
         method: 'POST',
@@ -390,14 +412,13 @@ export default function App() {
       });
       const data = await res.json();
       if (!data.success) {
-        alert(`Trade Failed: ${data.message || 'Unknown error'}`);
+        showToast(`Trade Failed: ${data.message || 'Unknown error'}`, 'error');
       } else {
-        alert(`Trade Submitted Successfully!`);
+        showToast('Trade Submitted Successfully!', 'success');
       }
     } catch (e: any) {
-      alert(`Network Error: ${e.message}`);
+      showToast(`Network Error: ${e.message}`, 'error');
     }
-    
     fetchStatus();
     fetchPositions();
   };
@@ -421,13 +442,18 @@ export default function App() {
     const slow = Number(botConfig.slowEmaPeriod);
     // Explicitly verified Issue #12: Validates EMA in the UI before submitting
     if (fast >= slow) {
-      alert(`Invalid EMAs: Fast EMA (${fast}) must be less than Slow EMA (${slow}).`);
+      showToast(`Invalid EMAs: Fast EMA (${fast}) must be less than Slow EMA (${slow}).`, 'error');
       return;
     }
 
     if (botConfig.symbol === 'ALL_ASSETS') {
-      const confirmAdd = window.confirm(`Are you sure you want to bulk add ${availableSymbols.length} slots for ALL available assets? This might impact rate limits.`);
-      if (!confirmAdd) return;
+      if (!confirmBulk) {
+        setConfirmBulk(true);
+        showToast(`Click Add again to confirm bulk adding ${availableSymbols.length} slots. This might impact rate limits.`, 'info');
+        setTimeout(() => setConfirmBulk(false), 5000);
+        return;
+      }
+      setConfirmBulk(false);
 
       // Fix #8: Parallel batches instead of serial awaits — 150 sequential fetches froze the UI
       // for ~15 seconds. Batching 10 at a time completes in ~1-2s and keeps UI responsive.
@@ -452,7 +478,7 @@ export default function App() {
         }
       }
 
-      alert(`Bulk add complete: ${addedCount} slots added.${failedCount > 0 ? ` ${failedCount} failed (duplicates or invalid).` : ''}`);
+      showToast(`Bulk add complete: ${addedCount} slots added.${failedCount > 0 ? ` ${failedCount} failed.` : ''}`, failedCount > 0 ? 'info' : 'success');
       fetchStatus();
       return;
     }
@@ -465,7 +491,9 @@ export default function App() {
       });
       const data = await res.json();
       if (!data.success) {
-        alert(data.message || 'Failed to add slot');
+        showToast(data.message || 'Failed to add slot', 'error');
+      } else {
+        showToast('Slot added successfully!', 'success');
       }
       fetchStatus();
     } catch (e) {
@@ -493,9 +521,10 @@ export default function App() {
       if (data.success) {
         setShowApiManager(false);
         setApiForm({ apiKey: '', apiSecret: '' });
+        showToast('API credentials saved!', 'success');
         fetchStatus();
       } else {
-        alert("Failed to save credentials: " + data.message);
+        showToast('Failed to save credentials: ' + data.message, 'error');
       }
     } catch (e) {
       console.error("Failed to save credentials", e);
@@ -509,9 +538,10 @@ export default function App() {
       if (data.success) {
         setShowApiManager(false);
         setApiForm({ apiKey: '', apiSecret: '' });
+        showToast('Credentials cleared.', 'info');
         fetchStatus();
       } else {
-        alert("Failed to clear credentials: " + data.message);
+        showToast('Failed to clear credentials: ' + data.message, 'error');
       }
     } catch (e) {
       console.error("Failed to clear credentials", e);
@@ -519,10 +549,10 @@ export default function App() {
   };
 
   const clearMemory = async () => {
-    if (!window.confirm("Are you sure you want to clear bot memory, all slots, and reset caches? This will also stop the bot.")) return;
     try {
       await fetch('/api/clear-memory', { method: 'POST' });
       fetchStatus();
+      showToast('Memory and all slots cleared.', 'info');
     } catch (e) {
       console.error("Failed to clear memory", e);
     }
@@ -541,11 +571,11 @@ export default function App() {
       if (data.success) {
         setBacktestResult(data.results);
       } else {
-        alert("Backtest failed: " + data.message);
+        showToast("Backtest failed: " + data.message, 'error');
       }
     } catch (e: any) {
       const msg = e.message === 'Failed to fetch' ? 'Request timed out or backend is unreachable (try fewer timeframes or shorter ranges)' : e.message;
-      alert("Backtest failed: " + msg);
+      showToast("Backtest failed: " + msg, 'error');
     } finally {
       setIsBacktesting(false);
     }
@@ -565,11 +595,11 @@ export default function App() {
       if (data.success) {
         setOptimizeResults(data.results);
       } else if (data.message !== 'Optimization stopped by user') {
-        alert("Optimization failed: " + data.message);
+        showToast("Optimization failed: " + data.message, 'error');
       }
     } catch (e: any) {
       const msg = e.message === 'Failed to fetch' ? 'Request timed out or backend is unreachable (try fewer timeframes or shorter ranges)' : e.message;
-      alert("Optimization failed: " + msg);
+      showToast("Optimization failed: " + msg, 'error');
     } finally {
       setIsOptimizing(false);
     }
@@ -604,7 +634,7 @@ export default function App() {
           </div>
 
           
-          <div className="flex bg-slate-200/50 p-1 rounded-lg">
+          <div className="flex bg-slate-200/50 p-1 rounded-lg overflow-x-auto whitespace-nowrap custom-scrollbar">
             <button 
               onClick={() => setActiveTab('trade')}
               className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-semibold transition-all ${activeTab === 'trade' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
@@ -627,13 +657,24 @@ export default function App() {
 
           <div className="flex flex-wrap items-center gap-3">
             {googleClientId && (
-              <button
-                onClick={handleGoogleLogin}
-                disabled={googleConnected}
-                className={`border rounded-lg px-4 py-2.5 text-sm font-semibold transition-all shadow-sm ${googleConnected ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-white border-slate-200 hover:border-indigo-500 hover:text-indigo-600 text-slate-700'}`}
-              >
-                {googleConnected ? '✅ Sheets Connected' : '📊 Connect Sheets'}
-              </button>
+              <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-1 shadow-sm">
+                <button
+                  onClick={handleGoogleLogin}
+                  disabled={googleConnected}
+                  className={`px-3 py-1.5 text-sm font-semibold transition-all rounded ${googleConnected ? 'text-emerald-700 bg-emerald-50/50' : 'text-slate-700 hover:text-indigo-600'}`}
+                >
+                  {googleConnected ? '✅ Sheets Connected' : '📊 Connect Sheets'}
+                </button>
+                {!googleConnected && (
+                  <button 
+                    onClick={() => setShowOAuthHelp(!showOAuthHelp)}
+                    className={`p-1.5 rounded hover:bg-slate-50 transition-colors ${showOAuthHelp ? 'text-indigo-600 bg-indigo-50/50' : 'text-slate-400'}`}
+                    title="Google Sheets Connection Help"
+                  >
+                    <HelpCircle className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
             )}
             <button 
               onClick={() => setShowApiManager(!showApiManager)}
@@ -647,6 +688,21 @@ export default function App() {
                 {isRunning ? `Active (${slots.length} slot${slots.length !== 1 ? 's' : ''})` : 'System Offline'}
               </span>
             </div>
+          </div>
+
+          {/* Toast Notifications */}
+          <div className="fixed bottom-6 right-6 z-[9999] flex flex-col gap-2 pointer-events-none">
+            {toasts.map(t => (
+              <div key={t.id} className={`flex items-center gap-2 px-4 py-3 rounded-xl shadow-lg text-sm font-semibold animate-fade-in pointer-events-auto ${
+                t.type === 'success' ? 'bg-emerald-600 text-white' :
+                t.type === 'error'   ? 'bg-rose-600 text-white' :
+                'bg-slate-800 text-white'
+              }`}>
+                {t.type === 'success' && <CheckCircle2 className="w-4 h-4 shrink-0" />}
+                {t.type === 'error'   && <AlertCircle className="w-4 h-4 shrink-0" />}
+                {t.message}
+              </div>
+            ))}
           </div>
         </header>
 
@@ -667,31 +723,55 @@ export default function App() {
         {showApiManager && (
           <div className="mb-6 p-6 bg-white border border-slate-200 rounded-xl shadow-sm">
             <h2 className="text-lg font-bold text-slate-900 mb-4">API Management</h2>
-            <p className="text-sm text-slate-500 mb-4">Enter your Delta Exchange API keys. These will be securely stored in-memory for this session only (Issue O).</p>
+            <p className="text-sm text-slate-500 mb-4">Enter your Delta Exchange API keys to enable live trading. Keys are stored safely in-memory during this session only. To find your keys, go to the Delta Exchange dashboard &gt; Settings &gt; API Keys, and create a new key with Trading permissions.</p>
+            
+            {hasKeys && (
+              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-xs font-medium flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>
+                  API credentials are currently set and active. To protect your keys, they cannot be modified directly. If you need to enter new keys, you must first click <strong>Clear Credentials</strong>.
+                </span>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-500 mb-1">API Key</label>
                 <input 
                   type="password" 
-                  value={apiForm.apiKey}
+                  value={hasKeys ? '••••••••••••••••••••' : apiForm.apiKey}
                   onChange={e => setApiForm({...apiForm, apiKey: e.target.value})}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white transition-all"
-                  placeholder="Enter API Key"
+                  disabled={hasKeys}
+                  className={`w-full border rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white transition-all ${
+                    hasKeys ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed' : 'bg-slate-50 border-slate-200'
+                  }`}
+                  placeholder={hasKeys ? "API Key is set" : "Enter API Key"}
                 />
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-500 mb-1">API Secret</label>
                 <input 
                   type="password" 
-                  value={apiForm.apiSecret}
+                  value={hasKeys ? '••••••••••••••••••••' : apiForm.apiSecret}
                   onChange={e => setApiForm({...apiForm, apiSecret: e.target.value})}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white transition-all"
-                  placeholder="Enter API Secret"
+                  disabled={hasKeys}
+                  className={`w-full border rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white transition-all ${
+                    hasKeys ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed' : 'bg-slate-50 border-slate-200'
+                  }`}
+                  placeholder={hasKeys ? "API Secret is set" : "Enter API Secret"}
                 />
               </div>
             </div>
             <div className="flex gap-3">
-              <button onClick={saveApiCredentials} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-semibold shadow-sm transition-colors">
+              <button 
+                onClick={saveApiCredentials} 
+                disabled={hasKeys}
+                className={`px-4 py-2 text-white rounded-lg text-sm font-semibold shadow-sm transition-colors ${
+                  hasKeys 
+                    ? 'bg-slate-300 text-slate-500 cursor-not-allowed shadow-none' 
+                    : 'bg-indigo-600 hover:bg-indigo-500'
+                }`}
+              >
                 Save Credentials
               </button>
               <button onClick={clearApiCredentials} className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-sm font-semibold shadow-sm transition-colors">
@@ -700,6 +780,28 @@ export default function App() {
               <button onClick={() => setShowApiManager(false)} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-semibold transition-colors">
                 Cancel
               </button>
+            </div>
+          </div>
+        )}
+
+        {showOAuthHelp && (
+          <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 w-full shadow-sm relative">
+            <AlertCircle className="w-5 h-5 text-amber-600 mt-0.5 shrink-0" />
+            <button 
+              onClick={() => setShowOAuthHelp(false)} 
+              className="absolute top-3 right-3 text-slate-400 hover:text-slate-700"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <div className="text-xs text-amber-800 space-y-2">
+              <h3 className="text-sm font-semibold text-amber-900">Google Sheets OAuth Setup & Error Fixes</h3>
+              <p className="font-medium">If you see <code className="bg-amber-100 px-1 py-0.5 rounded text-rose-700 font-bold">Error 400: origin_mismatch</code> when signing in:</p>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Your current URL (<code className="bg-amber-100 px-1 py-0.5 rounded">http://localhost:3000</code> or your domain) must be whitelisted in your Google Cloud Console.</li>
+                <li>Go to <strong>APIs & Services &gt; Credentials</strong> on Google Cloud.</li>
+                <li>Edit your OAuth 2.0 Client ID under "Authorized JavaScript origins" and add: <code className="bg-amber-100 px-1 py-0.5 rounded font-mono select-all">http://localhost:3000</code></li>
+                <li>Make sure to use your own Client ID in <code className="bg-amber-100 px-1 py-0.5 rounded">firebase-applet-config.json</code> if the default one is owned by a different developer.</li>
+              </ul>
             </div>
           </div>
         )}
@@ -722,10 +824,10 @@ export default function App() {
           </div>
         )}
 
-        <div className="grid md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           
           {/* Controls Column */}
-          <div className="space-y-6">
+          <div className="space-y-6 lg:col-span-2">
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-500 mb-4 uppercase tracking-wider">Slot Configuration</h2>
               
@@ -826,7 +928,7 @@ export default function App() {
                   </select>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Start Date (Optional)</label>
                     <input 
@@ -847,7 +949,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Fast EMA</label>
                     <input type="text" inputMode="decimal" 
@@ -868,7 +970,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Leverage (x)</label>
                     <input type="text" inputMode="decimal" 
@@ -893,7 +995,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Order Type</label>
                     <select 
@@ -923,7 +1025,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Initial Balance ($) - Backtest</label>
                     <input type="text" inputMode="decimal" 
@@ -970,7 +1072,7 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1">Take Profit (%)</label>
                     <input type="text" inputMode="decimal" 
@@ -1240,7 +1342,7 @@ export default function App() {
                       📊 Bollinger Bands Filter
                     </label>
                     {botConfig.useBbFilter && (
-                      <div className="grid grid-cols-2 gap-3 mt-3 ml-6 bg-slate-50 p-3 rounded-lg border border-slate-100">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 ml-6 bg-slate-50 p-3 rounded-lg border border-slate-100">
                         <div>
                           <label className="block text-xs font-semibold text-slate-500 mb-1">Period</label>
                           <input type="text" inputMode="decimal" value={botConfig.bbPeriod} onChange={e => updateConfig('bbPeriod', e.target.value)} className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-sm focus:outline-none focus:border-indigo-500 transition-all" />
@@ -1297,9 +1399,13 @@ export default function App() {
                   </button>
                   <button
                     onClick={addSlot}
-                    className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-bold transition-all duration-200 bg-indigo-600 text-white hover:bg-indigo-500 border border-indigo-600 shadow-sm"
+                    className={`w-full flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-bold transition-all duration-200 shadow-sm ${
+                      confirmBulk 
+                        ? 'bg-amber-500 text-white hover:bg-amber-400 border border-amber-500' 
+                        : 'bg-indigo-600 text-white hover:bg-indigo-500 border border-indigo-600'
+                    }`}
                   >
-                    <Plus className="w-4 h-4" /> Add Live Trading Slot
+                    <Plus className="w-4 h-4" /> {confirmBulk ? 'Confirm Bulk Add' : 'Add Live Trading Slot'}
                   </button>
                 </div>
               </div>
@@ -1336,9 +1442,161 @@ export default function App() {
               </div>
             </div>
           </div>
+          
+          <div className="space-y-6">
+            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 mb-4 uppercase tracking-wider">Engine Control</h2>
+              
+              <button 
+                onClick={toggleBot}
+                className={`w-full flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-bold transition-all duration-200 ${
+                  isRunning 
+                    ? 'bg-rose-600 text-white hover:bg-rose-500 border border-rose-600 shadow-sm' 
+                    : 'bg-emerald-600 text-white hover:bg-emerald-500 border border-emerald-600 shadow-sm'
+                }`}
+              >
+                {isRunning ? (
+                  <><Square className="w-4 h-4 fill-current" /> Stop Engine</>
+                ) : (
+                  <><Play className="w-4 h-4 fill-current" /> Start Engine</>
+                )}
+              </button>
+
+              {slots.length === 0 && !isRunning && (
+                <div className="mt-4 flex items-start gap-2 text-xs text-slate-500 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                  Add at least one trading slot above, then start the engine.
+                </div>
+              )}
+
+              <button
+                onClick={handlePing}
+                disabled={isPinging}
+                className="w-full mt-4 flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-semibold transition-all duration-200 bg-slate-50 text-slate-700 hover:bg-slate-100 border border-slate-200 shadow-sm disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${isPinging ? 'animate-spin' : ''}`} /> 
+                {isPinging ? 'Pinging API...' : 'Ping Delta API'}
+              </button>
+
+              {pingData && (
+                <div className="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500 font-medium">Status</span>
+                    {pingData.success ? (
+                      <span className="text-emerald-600 font-bold tracking-wide">CONNECTED</span>
+                    ) : (
+                      <span className="text-rose-600 font-bold tracking-wide">FAILED</span>
+                    )}
+                  </div>
+                  
+                  {pingData.profile && (
+                    <div className="flex flex-col border-t border-slate-200 pt-2 gap-1">
+                      <span className="text-slate-500 font-medium">Account Details</span>
+                      <span className="text-slate-800 font-semibold">{(pingData.profile.first_name || '') + ' ' + (pingData.profile.last_name || '')} ({pingData.profile.email})</span>
+                      <span className="text-slate-400 font-mono text-[10px]">ID: {pingData.profile.id}</span>
+                    </div>
+                  )}
+
+                  {pingData.assets && (
+                    <div className="flex flex-col border-t border-slate-200 pt-2 gap-1">
+                      <span className="text-slate-500 font-medium mb-1">Assets</span>
+                      {pingData.assets.length > 0 ? (
+                        pingData.assets.map((a: any, i: number) => (
+                           <div key={i} className="flex justify-between font-mono">
+                             <span className="text-slate-600 font-semibold">{a.asset}</span>
+                             <span className="text-slate-800 font-bold">{a.total} <span className="text-slate-400 font-normal">(Free: {a.free})</span></span>
+                           </div>
+                        ))
+                      ) : (
+                        <span className="text-slate-400">No balances</span>
+                      )}
+                    </div>
+                  )}
+
+                  {!pingData.success && (
+                    <div className="text-rose-600 mt-2 whitespace-pre-wrap">{pingData.message}</div>
+                  )}
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3 mt-4 pt-4 border-t border-slate-200">
+                <button 
+                  onClick={() => executeManualTrade('BUY')}
+                  className="flex items-center justify-center py-2 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 rounded-lg text-sm font-semibold shadow-sm transition-colors"
+                >
+                  Buy (Long)
+                </button>
+                <button 
+                  onClick={() => executeManualTrade('SELL')}
+                  className="flex items-center justify-center py-2 bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200 rounded-lg text-sm font-semibold shadow-sm transition-colors"
+                >
+                  Sell (Short)
+                </button>
+              </div>
+
+              <div className="mt-4 pt-4 border-t border-slate-200">
+                <button 
+                  onClick={() => {
+                    if (confirmClear) {
+                      clearMemory();
+                      setConfirmClear(false);
+                    } else {
+                      setConfirmClear(true);
+                      setTimeout(() => setConfirmClear(false), 3000);
+                    }
+                  }}
+                  className={`w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-semibold transition-all duration-200 shadow-sm ${
+                    confirmClear
+                      ? 'bg-rose-600 text-white hover:bg-rose-500 border border-rose-600'
+                      : 'bg-slate-50 text-slate-500 hover:bg-rose-50 hover:text-rose-600 border border-slate-200 hover:border-rose-200'
+                  }`}
+                >
+                  <Trash2 className="w-4 h-4" /> {confirmClear ? 'Click again to confirm clear' : 'Clear All Slots & Memory'}
+                </button>
+              </div>
+            </div>
+
+            {savedBacktests.length > 0 && (
+              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                <h2 className="text-sm font-semibold text-slate-500 mb-4 uppercase tracking-wider flex items-center justify-between">
+                  <span>Saved Backtests</span>
+                  <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-[10px]">{savedBacktests.length}</span>
+                </h2>
+                <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+                  {savedBacktests.map((run, i) => (
+                    <div key={i} className="p-3 border border-slate-100 rounded-lg bg-slate-50 relative group">
+                      <button onClick={() => deleteSaved(i)} className="absolute top-2 right-2 text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <X className="w-4 h-4" />
+                      </button>
+                      <div className="flex justify-between items-start mb-2">
+                        <div>
+                          <div className="font-bold text-slate-800 text-xs">{run.config.symbol} • {run.config.timeframe}</div>
+                          <div className="text-[10px] text-slate-500">{new Date(run.timestamp).toLocaleString()}</div>
+                        </div>
+                        <div className="text-right">
+                          <div className={`font-bold text-sm leading-none ${run.netProfit > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                            ${run.netProfit.toFixed(2)}
+                          </div>
+                          <div className="text-[10px] text-slate-500 mt-1">Net PnL</div>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-[10px] mt-2 pt-2 border-t border-slate-200">
+                        <div><span className="text-slate-400 block">EMA</span><span className="font-semibold text-slate-700">{run.config.fastEmaPeriod}/{run.config.slowEmaPeriod}</span></div>
+                        <div><span className="text-slate-400 block">Win Rate</span><span className="font-semibold text-slate-700">{run.winRate.toFixed(1)}%</span></div>
+                        <div><span className="text-slate-400 block">Drawdown</span><span className="font-semibold text-slate-700">{run.maxDrawdown.toFixed(1)}%</span></div>
+                      </div>
+                      <button onClick={() => setBotConfig(prev => ({ ...prev, ...run.config }))} className="mt-2 w-full py-1.5 bg-white border border-slate-200 text-[10px] font-semibold text-slate-600 rounded hover:bg-slate-100 transition-colors">
+                        Load Configuration
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* Main Content Column */}
-          <div className="md:col-span-2 flex flex-col gap-6">
+          <div className="lg:col-span-2 flex flex-col gap-6">
 
             <div className="space-y-6">
               {/* Backtest Results */}
@@ -1491,7 +1749,7 @@ export default function App() {
                    </h3>
                    <p className="text-[10px] text-indigo-600 mb-3">Maximize performance using grid search or AI-driven evolutionary genetic search (Max 10k candles).</p>
                    
-                   <div className="mb-4 grid grid-cols-2 gap-3">
+                   <div className="mb-4 grid grid-cols-1 md:grid-cols-2 gap-3">
                      <div>
                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Optimization Method</label>
                        <select 
@@ -1517,17 +1775,57 @@ export default function App() {
                    </div>
 
                     <div className="bg-indigo-100/30 p-3 rounded-lg border border-indigo-200/50 text-[10px] text-indigo-800 mb-4">
-                      <span className="font-bold block mb-2">Assets to Optimize (Comma Separated):</span>
-                      <input 
-                        type="text" 
-                        placeholder={`e.g. BTCUSDT, ETHUSDT (Leave blank for ${botConfig.symbol})`}
-                        value={(botConfig.optSymbols || []).join(', ')}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          updateConfig('optSymbols', val.split(',').map(s => s.trim().toUpperCase()).filter(s => s));
-                        }}
-                        className="w-full bg-white border border-indigo-100 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 uppercase"
-                      />
+                      <span className="font-bold block mb-2">Assets to Optimize:</span>
+                      <div className="flex flex-wrap gap-1 mb-2">
+                        {(botConfig.optSymbols || []).map((sym: string) => (
+                          <span key={sym} className="bg-indigo-200 text-indigo-800 px-2 py-0.5 rounded-full flex items-center gap-1">
+                            {sym}
+                            <button 
+                              onClick={() => updateConfig('optSymbols', botConfig.optSymbols.filter((s: string) => s !== sym))}
+                              className="hover:text-red-500 font-bold text-xs"
+                            >×</button>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="relative">
+                        <input 
+                          type="text" 
+                          placeholder="Search and select assets..."
+                          value={optSymbolSearchQuery}
+                          onFocus={() => setIsOptSymbolDropdownOpen(true)}
+                          onBlur={() => setTimeout(() => setIsOptSymbolDropdownOpen(false), 200)}
+                          onChange={(e) => setOptSymbolSearchQuery(e.target.value.toUpperCase())}
+                          className="w-full bg-white border border-indigo-100 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 uppercase"
+                        />
+                        {isOptSymbolDropdownOpen && (
+                          <div 
+                            className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-[0_4px_20px_-4px_rgba(0,0,0,0.1)] overflow-y-auto custom-scrollbar"
+                            style={{ maxHeight: '150px' }}
+                          >
+                            {availableSymbols
+                              .filter(sym => sym.includes(optSymbolSearchQuery) && !(botConfig.optSymbols || []).includes(sym))
+                              .map(sym => (
+                                <div
+                                  key={sym}
+                                  className="px-3 py-1.5 text-xs text-slate-700 hover:bg-indigo-50 cursor-pointer"
+                                  onClick={() => {
+                                    const current = botConfig.optSymbols || [];
+                                    if (!current.includes(sym)) {
+                                      updateConfig('optSymbols', [...current, sym]);
+                                    }
+                                    setOptSymbolSearchQuery('');
+                                    setIsOptSymbolDropdownOpen(false);
+                                  }}
+                                >
+                                  {sym}
+                                </div>
+                            ))}
+                            {availableSymbols.filter(sym => sym.includes(optSymbolSearchQuery) && !(botConfig.optSymbols || []).includes(sym)).length === 0 && (
+                               <div className="px-3 py-2 text-xs text-slate-500">No matches or already added.</div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                       <p className="mt-2 text-slate-500 text-[9px]">The optimizer will find the best configuration across these assets.</p>
                     </div>
 
@@ -1626,7 +1924,7 @@ export default function App() {
                     )}
 
                    {(botConfig.optimizationMethod || 'grid') !== 'genetic' ? (
-                     <div className="grid grid-cols-2 gap-3 mb-4">
+                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
                        <div className="bg-white p-2 border border-indigo-100 rounded">
                           <label className="block text-[10px] font-bold text-slate-500 mb-1">Fast EMA Range</label>
                           <div className="flex gap-2">
@@ -1704,7 +2002,7 @@ export default function App() {
                       if (r.cooldownCandles !== undefined) updateConfig('cooldownCandles', r.cooldownCandles);
                       if (r.gridStepPct !== undefined) updateConfig('gridStepPct', r.gridStepPct);
                       if (r.maxPyramidLevels !== undefined) updateConfig('maxPyramidLevels', r.maxPyramidLevels);
-                      alert('✅ Strategy configuration applied!');
+                      showToast('Strategy configuration applied!', 'success');
                     };
 
                     const addSlotFromResult = async (r: any, e: React.MouseEvent) => {
@@ -1748,12 +2046,12 @@ export default function App() {
                         if (data.success) {
                           fetchStatus();
                           fetchPositions();
-                          alert(`✅ Slot added: ${payload.symbol} ${payload.timeframe} EMA${payload.fastEmaPeriod}/${payload.slowEmaPeriod}`);
+                          showToast(`✅ Slot added: ${payload.symbol} ${payload.timeframe} EMA${payload.fastEmaPeriod}/${payload.slowEmaPeriod}`, 'success');
                         } else {
-                          alert(`❌ Failed: ${data.message}`);
+                          showToast(`❌ Failed: ${data.message}`, 'error');
                         }
                       } catch (err: any) {
-                        alert(`❌ Error: ${err.message}`);
+                        showToast(`❌ Error: ${err.message}`, 'error');
                       }
                     };
 
@@ -1970,156 +2268,13 @@ export default function App() {
               </div>
             </div>
 
-            {/* Saved Backtests */}
-            {savedBacktests.length > 0 && (
-              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                <h2 className="text-sm font-semibold text-slate-500 mb-4 uppercase tracking-wider flex items-center justify-between">
-                  <span>Saved Backtests</span>
-                  <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-[10px]">{savedBacktests.length}</span>
-                </h2>
-                <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
-                  {savedBacktests.map((run, i) => (
-                    <div key={i} className="p-3 border border-slate-100 rounded-lg bg-slate-50 relative group">
-                      <button onClick={() => deleteSaved(i)} className="absolute top-2 right-2 text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <X className="w-4 h-4" />
-                      </button>
-                      <div className="flex justify-between items-start mb-2">
-                        <div>
-                          <div className="font-bold text-slate-800 text-xs">{run.config.symbol} • {run.config.timeframe}</div>
-                          <div className="text-[10px] text-slate-500">{new Date(run.timestamp).toLocaleString()}</div>
-                        </div>
-                        <div className="text-right">
-                          <div className={`font-bold text-sm leading-none ${run.netProfit > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                            ${run.netProfit.toFixed(2)}
-                          </div>
-                          <div className="text-[10px] text-slate-500 mt-1">Net PnL</div>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2 text-[10px] mt-2 pt-2 border-t border-slate-200">
-                        <div><span className="text-slate-400 block">EMA</span><span className="font-semibold text-slate-700">{run.config.fastEmaPeriod}/{run.config.slowEmaPeriod}</span></div>
-                        <div><span className="text-slate-400 block">Win Rate</span><span className="font-semibold text-slate-700">{run.winRate.toFixed(1)}%</span></div>
-                        <div><span className="text-slate-400 block">Drawdown</span><span className="font-semibold text-slate-700">{run.maxDrawdown.toFixed(1)}%</span></div>
-                      </div>
-                      <button onClick={() => setBotConfig(prev => ({ ...prev, ...run.config }))} className="mt-2 w-full py-1.5 bg-white border border-slate-200 text-[10px] font-semibold text-slate-600 rounded hover:bg-slate-100 transition-colors">
-                        Load Configuration
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-500 mb-4 uppercase tracking-wider">Engine Control</h2>
-              
-              <button 
-                onClick={toggleBot}
-                className={`w-full flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-bold transition-all duration-200 ${
-                  isRunning 
-                    ? 'bg-rose-600 text-white hover:bg-rose-500 border border-rose-600 shadow-sm' 
-                    : 'bg-emerald-600 text-white hover:bg-emerald-500 border border-emerald-600 shadow-sm'
-                }`}
-              >
-                {isRunning ? (
-                  <><Square className="w-4 h-4 fill-current" /> Stop Engine</>
-                ) : (
-                  <><Play className="w-4 h-4 fill-current" /> Start Engine</>
-                )}
-              </button>
-
-              {slots.length === 0 && !isRunning && (
-                <div className="mt-4 flex items-start gap-2 text-xs text-slate-500 bg-slate-50 p-3 rounded-lg border border-slate-200">
-                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                  Add at least one trading slot above, then start the engine.
-                </div>
-              )}
-
-              <button
-                onClick={handlePing}
-                disabled={isPinging}
-                className="w-full mt-4 flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-semibold transition-all duration-200 bg-slate-50 text-slate-700 hover:bg-slate-100 border border-slate-200 shadow-sm disabled:opacity-50"
-              >
-                <RefreshCw className={`w-4 h-4 ${isPinging ? 'animate-spin' : ''}`} /> 
-                {isPinging ? 'Pinging API...' : 'Ping Delta API'}
-              </button>
-
-              {pingData && (
-                <div className="mt-4 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-500 font-medium">Status</span>
-                    {pingData.success ? (
-                      <span className="text-emerald-600 font-bold tracking-wide">CONNECTED</span>
-                    ) : (
-                      <span className="text-rose-600 font-bold tracking-wide">FAILED</span>
-                    )}
-                  </div>
-                  
-                  {pingData.profile && (
-                    <div className="flex flex-col border-t border-slate-200 pt-2 gap-1">
-                      <span className="text-slate-500 font-medium">Account Details</span>
-                      <span className="text-slate-800 font-semibold">{(pingData.profile.first_name || '') + ' ' + (pingData.profile.last_name || '')} ({pingData.profile.email})</span>
-                      <span className="text-slate-400 font-mono text-[10px]">ID: {pingData.profile.id}</span>
-                    </div>
-                  )}
-
-                  {pingData.assets && (
-                    <div className="flex flex-col border-t border-slate-200 pt-2 gap-1">
-                      <span className="text-slate-500 font-medium mb-1">Assets</span>
-                      {pingData.assets.length > 0 ? (
-                        pingData.assets.map((a: any, i: number) => (
-                           <div key={i} className="flex justify-between font-mono">
-                             <span className="text-slate-600 font-semibold">{a.asset}</span>
-                             <span className="text-slate-800 font-bold">{a.total} <span className="text-slate-400 font-normal">(Free: {a.free})</span></span>
-                           </div>
-                        ))
-                      ) : (
-                        <span className="text-slate-400">No balances</span>
-                      )}
-                    </div>
-                  )}
-
-                  {!pingData.success && (
-                    <div className="text-rose-600 mt-2 whitespace-pre-wrap">{pingData.message}</div>
-                  )}
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-3 mt-4 pt-4 border-t border-slate-200">
-                <button 
-                  onClick={() => executeManualTrade('BUY')}
-                  className="flex items-center justify-center py-2 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 rounded-lg text-sm font-semibold shadow-sm transition-colors"
-                >
-                  Buy (Long)
-                </button>
-                <button 
-                  onClick={() => executeManualTrade('SELL')}
-                  className="flex items-center justify-center py-2 bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200 rounded-lg text-sm font-semibold shadow-sm transition-colors"
-                >
-                  Sell (Short)
-                </button>
-              </div>
-
-              <div className="mt-4 pt-4 border-t border-slate-200">
-                <button 
-                  onClick={clearMemory}
-                  className="w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-semibold transition-all duration-200 bg-slate-50 text-slate-500 hover:bg-rose-50 hover:text-rose-600 border border-slate-200 hover:border-rose-200 shadow-sm"
-                >
-                  <Trash2 className="w-4 h-4" /> Clear All Slots & Memory
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Main Content Column */}
-          <div className="md:col-span-2 flex flex-col gap-6">
-            {/* Active Trading Slots */}
             <div className="flex-shrink-0 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
-              <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50">
-                <h2 className="text-base font-bold text-slate-800 flex items-center gap-2">
-                  Active Trading Slots ({slots.length})
-                </h2>
+              <div className="p-4 bg-slate-50/50 border-b border-slate-200 flex justify-between items-center">
+                <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-indigo-500" /> Active Trading Slots ({slots.length})
+                </h3>
               </div>
-              <div className="p-4 min-h-[100px]">
+              <div className="p-4 min-h-[100px] overflow-auto">
                 {slots.length === 0 ? (
                   <div className="py-8 text-center text-slate-400 font-medium">
                     No trading slots configured. Use the form on the left to add slots.
